@@ -1,0 +1,368 @@
+---
+title: "An investigation into stock market comovements between Central Europe and the USA using the ADCC model"
+author: "Piotr Nowicki"
+date: 03-15-2023
+date-format: "DD/MM/YYYY"
+format: 
+  pdf:
+    toc: true
+    geometry: 
+      - top=30mm
+      - left=30mm
+editor: visual
+execute: 
+  cache: true
+  warning: false
+  message: false
+theme: cosmo
+bibliography: references.bib
+---
+
+## Introduction
+
+The aim of the research is to examine stock market comovements between Central Europe and the USA. This study follows closely the work of @gjika2013. The main differences are:
+
+1.  Analysing comovements between Central Europe and the USA instead of the Eurozone.
+2.  Longer time window (2001 - 2022) instead of 2001-2011.
+3.  Taking into account the pandemic period.
+
+Central Europe is represented by the Czech Republic (PX), Hungary (BUX), and Poland (WIG). The USA market is defined as the S&P500 index. The following hypotheses are stated:
+
+1.  The indexes exhibit asymmetric conditional variance.
+2.  The conditional correlation is asymmetric.
+3.  The conditional correlation increases over time.
+4.  The financial crisis and pandemic rise the conditional correlation.
+5.  The conditional variance is positively related to the conditional correlation.
+
+This work is meant to be as short as possible without going into details. It presents the necessary code for multivariate GARCH estimation in R and, to some extent, it expands the paper by @gjika2013. If you are interested in any part of the work, you can contact me.
+
+## Data description
+
+Below you can find basic data wrangling and plots.
+
+```{r}
+#| label: data-preprocessing
+#| results: hide
+
+libraries <- c("tidyverse", "xts", "fBasics", "tseries", "FinTS", "rugarch",
+               "rmgarch", "urca", "reshape2", "ggplot2", "stargazer", "lmtest",
+               "kableExtra", "sandwich")
+lapply(libraries, require, character.only = T)
+
+bux <- "http://stooq.com/q/d/l/?s=^bux&i=d"
+px <- "http://stooq.com/q/d/l/?s=^px&i=d"
+wig <- "http://stooq.com/q/d/l/?s=wig&i=d"
+
+files_list <- c(bux, px, wig)
+
+stocks <- lapply(files_list, read_csv, 
+                 col_select = c("Date", "Close")) %>% 
+             map(~transmute(., 
+                            Date = as.Date(Date),
+                            Value = Close)) %>% 
+            map(~dplyr::filter(., Date >= "2001-01-01")) %>% 
+            purrr::reduce(inner_join, by = "Date")
+wd <- getwd()
+sp <- read_csv("^spx_d.csv",
+               col_select = c("Date", "Close")) %>% 
+      dplyr::filter(Date >= "2001-01-01")
+
+stocks <- inner_join(stocks, sp, by = "Date")
+colnames(stocks)[2:5] <- c("BUX", "PX", "WIG", "SPX")
+```
+
+Besides PX, the stock market indexes follow roughly the same trend.
+
+```{r}
+#| label: stock indexes graph
+stocks_1 <- stocks %>% mutate(PX = PX*10, SPX = SPX*10) %>% 
+  melt(id.vars = "Date", value.name = "value", variable.name = "stock")
+
+ggplot(data=stocks_1, aes(x=Date, y=value, group=stock, colour=stock))+
+  geom_line()+
+  scale_y_continuous(sec.axis = sec_axis(~./10))+
+  labs(x="", y="")+
+  ggtitle("Stock indexes", )+
+  scale_x_date(date_breaks="3 years", date_labels="%Y")+
+  theme_minimal()+
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = c(0.1, 0.8),
+        legend.title = element_blank())
+
+```
+
+Summary statistics of the stock market indexes' returns. The returns exhibit left-skewness, excess kurtosis, non-normality, autocorrelation, and ARCH effects. Test statistics were presented for the ADF test and p-values for the other tests. Every analysis is conducted on the returns hereafter.
+
+```{r}
+#| label: statistical description
+#| cap-location: margin
+
+# logarithm transformation
+stocks[2:5] <- do.call(cbind, lapply(log(stocks[2:5]), diff.xts))
+stocks <- na.omit(stocks)
+
+# ADF test
+ADF <- apply(stocks[-1], 2, 
+             function(x) summary(ur.df(x, "none", selectlags="AIC"))@teststat)
+
+# Jarque-Bera test
+JB <- apply(stocks[-1], 2, function(x) jarque.bera.test(x)$p.value)
+
+# Ljung-Box test
+LB <- apply(stocks[-1], 2, function(x) Box.test(x, lag = 8, type = "Ljung-Box")$p.value)
+
+# ARCH LM test
+ARCH <- apply(stocks[-1], 2, function(x) ArchTest(x, lags = 4)$p.value)
+
+basicStats(stocks[2:5])[c("Mean","Stdev","Skewness", "Kurtosis", "Minimum", "Maximum"),] %>% 
+  rbind(ADF, JB, LB, ARCH) %>% 
+  `rownames<-`(c("Mean", "Stdev", 
+                 "Skewness", "Kurtosis", 
+                 "Min", "Max.", 
+                 "ADF", "Jarque-Bera",
+                 "Ljung-Box", "ARCH-LM")) %>% 
+  kable(format="markdown")
+```
+
+Unconditional correlations are moderate within Central Europe and low between Central Europe and the USA. It is worth noting that the unconditional correlations vis-a-vis the Eurozone are higher than for the USA in @gjika2013.
+
+```{r}
+#| label: Pearson correlation
+cor(stocks[-1])
+```
+
+The returns for the stock market indexes. The ARCH effects can be seen for some periods.
+
+```{r}
+#| label: plots for the time series returns
+stocks_2 <- melt(stocks, id.vars = "Date", value.name = "value", variable.name = "stock")
+ggplot(data=stocks_2, aes(x=Date, y=value, group=stock, color=stock))+
+  facet_wrap(~stock)+
+  geom_line()+
+  labs(x="", y="")+
+  scale_x_date(date_breaks="4 years", date_labels="%Y")+
+  theme_minimal()+
+  theme(legend.position = "none")
+```
+
+## Specifying GARCH models
+
+4 models will be fitted to the data: standard GARCH, GJR-GARCH (an asymmetric conditional variance), absolute value GARCH, and TGRACH (an asymmetric standard deviation). For each of the models ARMA(1,0) and GARCH(1,1) were fitted in accordance with @gjika2013. The best models are chosen by minimising BIC.
+
+```{r}
+#| label:  defining univariate GARCH specifications
+sGARCH_spec <- ugarchspec(
+          mean.model = list(armaOrder = c(1, 0),
+                            include.mean = T),
+          variance.model = list(model = "sGARCH",
+                                garchOrder = c(1, 1)),
+          distribution.model = "std"
+)
+
+gjrGARCH_spec <- ugarchspec(
+                  mean.model = list(armaOrder = c(1, 0),
+                                    include.mean = T),
+                  variance.model = list(model = "gjrGARCH",
+                                        garchOrder = c(1, 1)),
+                  distribution.model= "std"
+)
+
+avGARCH_spec <- ugarchspec(
+  mean.model = list(armaOrder = c(1, 0),
+                    include.mean = T),
+  variance.model = list(model = "apARCH",
+                        garchOrder = c(1, 1)),
+  distribution.model= "std",
+  fixed.pars = list(gamma1 = 0, delta = 1)
+)
+
+TGARCH_spec <- ugarchspec(
+  mean.model = list(armaOrder = c(1, 0),
+                    include.mean = T),
+  variance.model = list(model = "apARCH",
+                        garchOrder = c(1, 1)),
+  distribution.model= "std",
+  fixed.pars = list(delta = 1)
+)
+
+sGARCH_bayes <- apply(stocks[-1], 2, function(x) infocriteria(
+  ugarchfit(sGARCH_spec, x))[2])
+gjrGARCH_bayes <- apply(stocks[-1], 2, function(x) infocriteria(
+  ugarchfit(gjrGARCH_spec, x))[2])
+avGARCH_bayes <- apply(stocks[-1], 2, function(x) infocriteria(
+  ugarchfit(avGARCH_spec, x, solver = 'hybrid'))[2])
+TGARCH_bayes <- apply(stocks[-1], 2, function(x) infocriteria(
+  ugarchfit(TGARCH_spec, x))[2])
+
+# Bayesian IC
+rbind(sGARCH_bayes, gjrGARCH_bayes, avGARCH_bayes, TGARCH_bayes)
+```
+
+The following GARCH specifications are fitted: GJR-GARCH (BUX), TGARCH (PX, WIG, SPX). Below you can find the conditional standard deviations plots.
+
+```{r}
+#| label: conditional standard deviations
+# BUX - GJRGARCH; PX - AVGARCH; WIG - AVGARCH; SPX - TGARCH
+bux_garch <- ugarchfit(gjrGARCH_spec, stocks$BUX)
+px_garch <- ugarchfit(TGARCH_spec, stocks$PX)
+wig_garch <- ugarchfit(TGARCH_spec, stocks$WIG)
+spx_garch <- ugarchfit(TGARCH_spec, stocks$SPX)
+
+# plot of conditional standard deviations
+stocks_3 <- data.frame(Date = stocks$Date,
+                       BUX = bux_garch@fit$sigma,
+                       PX = px_garch@fit$sigma,
+                       WIG = wig_garch@fit$sigma,
+                       SPX = spx_garch@fit$sigma) %>% 
+            melt(id.vars = "Date", value.name = "sigma", variable.name = "stock")
+
+ggplot(data=stocks_3, aes(x=Date, y=sigma, group=stock, color=stock))+
+  facet_wrap(~stock)+
+  geom_line()+
+  labs(x="", y="")+
+  scale_x_date(date_breaks="4 years", date_labels="%Y")+
+  theme_minimal()+
+  theme(legend.position = "none")
+```
+
+## Conditional correlations
+
+The next plot shows the conditional correlations from the DCC (1,1) model fitted to every pair. The asymmetry was not found to be statistically significant, therefore only DCC is applied.
+
+```{r}
+#| label: conditional correlation
+# BUX - PX
+uspec1 <- multispec(c(gjrGARCH_spec, TGARCH_spec))
+adcc1 <- dccspec(uspec1, dccOrder = c(1, 1), distribution = "mvnorm", model = "DCC")
+fit1 <- dccfit(adcc1, data = stocks[c(2,3)])
+
+# BUX - WIG
+uspec2 <- multispec(c(gjrGARCH_spec, TGARCH_spec))
+adcc2 <- dccspec(uspec2, dccOrder = c(1, 1), distribution = "mvnorm", model = "DCC")
+fit2 <- dccfit(adcc2, data = stocks[c(2,4)])
+
+# PX - WIG
+uspec3 <- multispec(c(TGARCH_spec, TGARCH_spec))
+adcc3 <- dccspec(uspec3, dccOrder = c(1, 1), distribution = "mvnorm", model = "DCC")
+fit3 <- dccfit(adcc3, data = stocks[c(3,4)])
+
+# BUX - SPX
+uspec4 <- multispec(c(gjrGARCH_spec, TGARCH_spec))
+adcc4 <- dccspec(uspec4, dccOrder = c(1, 1), distribution = "mvnorm", model = "DCC")
+fit4 <- dccfit(adcc4, data = stocks[c(2,5)])
+
+# PX - SPX
+uspec5 <- multispec(c(TGARCH_spec, TGARCH_spec))
+adcc5 <- dccspec(uspec5, dccOrder = c(1, 1), distribution = "mvnorm", model = "DCC")
+fit5 <- dccfit(adcc5, data = stocks[c(3,5)])
+
+# WIG - SPX
+uspec6 <- multispec(c(TGARCH_spec, TGARCH_spec))
+adcc6 <- dccspec(uspec6, dccOrder = c(1, 1), distribution = "mvnorm", model = "DCC")
+fit6 <- dccfit(adcc6, data = stocks[c(4,5)])
+
+# plot conditional correlations
+
+stocks_4 <- data.frame(Date = stocks$Date,
+                       BUXPX = as.vector(rcor(fit1, type="R", output="matrix")),
+                       BUXWIG = as.vector(rcor(fit2, type="R", output="matrix")),
+                       PXWIG = as.vector(rcor(fit3, type="R", output="matrix")),
+                       BUXSPX = as.vector(rcor(fit4, type="R", output="matrix")),
+                       PXSPX = as.vector(rcor(fit5, type="R", output="matrix")),
+                       WIGSPX = as.vector(rcor(fit6, type="R", output="matrix"))) %>% 
+            melt(id.vars = "Date", value.name = "corrs", variable.name = "pair")
+
+ggplot(data=stocks_4, aes(x=Date, y=corrs, group=pair, color=pair))+
+  facet_wrap(~pair, ncol = 2)+
+  geom_line()+
+  labs(x="", y="")+
+  scale_x_date(date_breaks="4 years", date_labels="%Y")+
+  theme_minimal()+
+  theme(legend.position = "none")
+
+```
+
+## Conditional correlation during stress periods
+
+The following models will be estimated. Equation (1) refers to the effect of the financial crisis and pandemic on the conditional correlation. Whereas equation (2) tests the effect of the conditional standard deviation on the conditional correlation.
+
+$$
+\rho_{i j, t} = \beta_0 + \beta_1I_{crisis} + \beta_2I_{pandemic} + \epsilon_{ij,t}
+$$ {#eq-1}
+
+$$
+\rho_{ij,t} = \alpha_0 + \alpha_1\sigma_{i,t} + \alpha_2\sigma_{j,t} + \epsilon_{ij,t}
+$$ {#eq-2}
+
+```{r}
+#| label: the financial crisis and pandemic
+
+stocks_5 <- data.frame(Date = stocks$Date,
+                       BUXPX = as.vector(rcor(fit1, type="R", output="matrix")),
+                       BUXWIG = as.vector(rcor(fit2, type="R", output="matrix")),
+                       PXWIG = as.vector(rcor(fit3, type="R", output="matrix")),
+                       BUXSPX = as.vector(rcor(fit4, type="R", output="matrix")),
+                       PXSPX = as.vector(rcor(fit5, type="R", output="matrix")),
+                       WIGSPX = as.vector(rcor(fit6, type="R", output="matrix"))) %>% 
+            mutate(crisis = ifelse(Date >= "2008-09-15" & Date <= "2011-11-11", 1, 0),
+                   pandemic = ifelse(Date >= "2020-03-11", 1, 0))
+
+models <- lapply(stocks_5[2:7], function(x) lm(x ~ crisis + pandemic, data=stocks_5))
+models2 <- lapply(models, function(x) coeftest(x, vcov. = vcovHAC)) #robust SE
+
+labels <- c("BUXPX", "BUXWIG", "PXWIG", "BUXPSX", "PXSPX", "WIGSPX")
+stargazer(models2, type="text", 
+          column.labels = labels, 
+          model.numbers = F, 
+          notes.label = "Notes:",
+          notes = "HAC standard errors",
+          covariate.labels = c("crisis", "pandemic", "constant"),
+          dep.var.caption = "conditional correlation")
+```
+
+```{r}
+#| label: conditional correlations and standard deviations
+
+stocks_6 <- data.frame(Date = stocks$Date,
+                       BUXSPX = as.vector(rcor(fit4, type="R", output="matrix")),
+                       PXSPX = as.vector(rcor(fit5, type="R", output="matrix")),
+                       WIGSPX = as.vector(rcor(fit6, type="R", output="matrix")),
+                       BUX = bux_garch@fit$sigma,
+                       PX = px_garch@fit$sigma,
+                       WIG = wig_garch@fit$sigma,
+                       SPX = spx_garch@fit$sigma)
+
+m1 <- lm(BUXSPX ~ BUX + SPX, data = stocks_6)
+m2 <- lm(PXSPX ~ PX + SPX, data = stocks_6)
+m3 <- lm(WIGSPX ~ WIG + SPX, data = stocks_6)
+all_models <- lapply(list(m1, m2, m3), function(x) coeftest(x, vcov. = NeweyWest))
+
+labs <- c("BUX-SPX", "PX-SPX", "WIG-SPX")
+stargazer(all_models, type="text", 
+          column.labels = labs, 
+          model.numbers = F, 
+          notes.label = "Notes:",
+          notes = "HAC standard errors",
+          dep.var.caption = "conditional correlation",
+          covariate.labels = c(NA, NA, "constant"))
+```
+
+The estimation of equation (1) points to the increase of conditional correlation during the financial crisis but the pandemic did not have any effect.
+
+The estimation of equation (2) shows no relation between the conditional correlations and conditional standard deviations.
+
+## Conclusions
+
+Regarding the hypotheses stated in the introduction, the following conclusions can be drawn:
+
+1.  The indexes exhibit the asymmetric conditional variance. The best GARCH models were asymmetric ones: GJR-GARCH and TGARCH.
+2.  There is no asymmetric conditional correlation between the indexes. DCC (1,1) is sufficient.
+3.  The conditional correlations are not strictly increasing. Over the longer period, they are stable for the Central European countries. There might have been a small upward change between Central Europe and the USA.
+4.  The financial crisis was associated with an increase in the conditional correlations. However, the pandemic was not.
+5.  The conditional standard deviation is not positively related to the conditional correlation.
+
+The results (1) and (2) are the same as in @gjika2013. The (3) is different - the longer time window shows the reverse to the mean that could not be seen in the referenced study. The association between the financial crisis and conditional correlations was also confirmed. Interestingly enough, the pandemic did not have a similar effect (probably due to the different responses from policymakers). Lastly, (5) is at odds with the findings of @gjika2013.
+
+That being said, it seems a diversification benefit is not overestimated in a portfolio consisting of assets from Central Europe and the USA - contrary to the Eurozone in @gjika2013. It is also not clear whether during a crisis the diversification benefit is reduced (but it was the case in the financial crisis).
+
+## References {.unnumbered}
